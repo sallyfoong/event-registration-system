@@ -1,0 +1,144 @@
+# Event Registration System - full stack.
+#
+# One file, two ways to use it:
+#
+#   docker compose up -d db            database only, for `npm run dev` on the host
+#   docker compose up -d --build       the whole thing in containers
+#
+# There is no separate "staging" file. The same compose definition is what
+# runs on a server; only the .env next to it changes.
+#
+# The web container (nginx) serves the built React bundle and proxies
+# /api/* to the api container, so the browser only ever talks to one
+# origin. Everything published to the host is bound to 127.0.0.1 - the
+# only thing that should reach these ports is the reverse proxy in front.
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: event-registration-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${DB_NAME:-event_registration}
+      MYSQL_USER: ${DB_USER:-event_app}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-eventapp}
+    ports:
+      # bound to loopback: the database is reachable from this machine and
+      # from the other containers, but not from the internet
+      - '127.0.0.1:${DB_PORT:-3306}:3306'
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'mysqladmin',
+          'ping',
+          '-h',
+          '127.0.0.1',
+          '-uroot',
+          '-p${DB_ROOT_PASSWORD:-rootpassword}',
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+
+  api:
+    build:
+      context: ./server
+    container_name: event-registration-api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 8000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # the browser loads the bundle from the same host that serves the
+      # API, so the only allowed origin is the site's own address
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8001}
+      # one reverse proxy (nginx) sits in front of the API, so one hop of
+      # X-Forwarded-For is trustworthy. With this off, every visitor
+      # would share the proxy's IP and the rate limiter would treat the
+      # whole internet as one client.
+      TRUST_PROXY: 'true'
+      DB_DIALECT: mysql
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-event_registration}
+      DB_USER: ${DB_USER:-event_app}
+      DB_PASSWORD: ${DB_PASSWORD:-eventapp}
+      PAGE_SIZE: 10
+      # how long a read may be served from the in-process cache. Short by
+      # design: the TTL, not the invalidation, is what bounds staleness if
+      # this ever runs as more than one instance. 0 disables the cache.
+      CACHE_TTL_MS: ${CACHE_TTL_MS:-10000}
+      ONEMAP_EMAIL: ${ONEMAP_EMAIL:-}
+      ONEMAP_PASSWORD: ${ONEMAP_PASSWORD:-}
+      # a pre-issued token (three days) is enough on its own; it saves the
+      # login round trip and keeps the password out of the container
+      ONEMAP_TOKEN: ${ONEMAP_TOKEN:-}
+      ONEMAP_BASE_URL: ${ONEMAP_BASE_URL:-https://www.onemap.gov.sg}
+    depends_on:
+      db:
+        # the API syncs the schema on boot; starting it before MySQL is
+        # accepting connections would just fail the boot
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:${API_PORT:-8000}:8000'
+    volumes:
+      # the logger writes to ./logs - keeping it on a volume means the
+      # files survive a container rebuild
+      - api_logs:/app/logs
+
+  seed:
+    build:
+      context: ./server
+      target: seed
+    container_name: event-registration-seed
+    # a one-shot job, not a service: `docker compose run --rm seed --demo`
+    restart: 'no'
+    profiles: ['tools']
+    environment:
+      NODE_ENV: production
+      DB_DIALECT: mysql
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-event_registration}
+      DB_USER: ${DB_USER:-event_app}
+      DB_PASSWORD: ${DB_PASSWORD:-eventapp}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # the seed resolves demo addresses through the same OneMap client as
+      # the API, so it needs the same credentials
+      ONEMAP_EMAIL: ${ONEMAP_EMAIL:-}
+      ONEMAP_PASSWORD: ${ONEMAP_PASSWORD:-}
+      ONEMAP_TOKEN: ${ONEMAP_TOKEN:-}
+      ONEMAP_BASE_URL: ${ONEMAP_BASE_URL:-https://www.onemap.gov.sg}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./client
+      args:
+        # relative path: the API is reached through nginx under the same
+        # origin, so the browser never makes a cross-origin request
+        VITE_API_BASE_URL: /api
+    container_name: event-registration-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      # 8080 inside, because the container runs as an unprivileged user and
+      # binding a port below 1024 needs privileges. The published port is
+      # unchanged, so nothing in front of this has to move.
+      - '127.0.0.1:${WEB_PORT:-8081}:8080'
+
+volumes:
+  mysql_data:
+  api_logs:

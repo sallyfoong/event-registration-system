@@ -1,0 +1,12 @@
+# Normalize line endings in the repo; check out with LF on all platforms.
+* text=auto eol=lf
+
+# Windows-only native binary must stay binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary
+*.sqlite binary
+
+# Lockfiles are large but must stay exact
+package-lock.json -diff linguist-generated=true
